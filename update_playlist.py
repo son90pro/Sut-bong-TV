@@ -1,22 +1,11 @@
 from datetime import datetime, timedelta
 import json
 import re
+from bs4 import BeautifulSoup
+from curl_cffi import requests
 import pytz
-import requests
 
 TZ_VN = pytz.timezone('Asia/Ho_Chi_Minh')
-
-# Session & Header chuẩn giả lập ứng dụng di động / Chrome
-HEADERS = {
-    'User-Agent': (
-        'Mozilla/5.0 (Android 16; Mobile; rv:157.0) Gecko/157.0 Firefox/157.0'
-    ),
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Referer': 'https://sutbongtve.cc/',
-    'Origin': 'https://sutbongtve.cc',
-    'Content-Type': 'application/json',
-}
 
 
 def get_sport_icon(sport_text):
@@ -33,7 +22,7 @@ def get_sport_icon(sport_text):
 
 
 def parse_timestamp(ts):
-  """Chuyển thời gian sang múi giờ Việt Nam UTC+7."""
+  """Quy đổi thời gian trận đấu sang múi giờ Việt Nam UTC+7."""
   try:
     if isinstance(ts, (int, float)) or (isinstance(ts, str) and ts.isdigit()):
       ts_val = float(ts)
@@ -53,41 +42,25 @@ def parse_timestamp(ts):
 
 
 def fetch_matches_data():
-  session = requests.Session()
-  session.headers.update(HEADERS)
   matches = []
+  session = requests.Session(impersonate='chrome120')
 
-  # 1. Gọi API rainbowbridge / track theo đúng payload request mẫu của anh
-  track_url = 'https://api.rainbowbridge.fit/track'
-  track_payload = {
-      'session_id': 'bf0a276f-1fd2-43aa-bca8-395ae47536c4',
-      'user_cookie': 'd4d05370-ba46-4394-b1fe-61d51da8df28',
-      'url': 'https://sutbongtve.cc/',
-      'hostname': 'sutbongtve.cc',
-      'referer': 'https://www.google.com/',
-      'browser': (
-          'Mozilla/5.0 (Android 16; Mobile; rv:157.0) Gecko/157.0'
-          ' Firefox/157.0'
-      ),
-      'is_bot': 0,
+  headers = {
+      'Referer': 'https://sutbongtve.cc/',
+      'Origin': 'https://sutbongtve.cc',
+      'Accept': 'application/json, text/plain, */*',
   }
 
-  try:
-    session.post(track_url, json=track_payload, timeout=8)
-  except Exception:
-    pass
-
-  # 2. Thử lấy danh sách trận đấu qua các API chính & dự phòng
+  # 1. Gọi trực tiếp API nội bộ của trang web
   api_urls = [
       'https://sutbongtve.cc/api/v1/matches',
       'https://sutbongtve.cc/api/matches',
       'https://sutbongtve.cc/json/matches.json',
-      'https://api.rainbowbridge.fit/api/matches',
   ]
 
   for url in api_urls:
     try:
-      res = session.get(url, timeout=10)
+      res = session.get(url, headers=headers, timeout=10)
       if res.status_code == 200:
         data = res.json()
         if isinstance(data, list) and len(data) > 0:
@@ -103,30 +76,43 @@ def fetch_matches_data():
     except Exception:
       continue
 
-  # 3. Nếu bị chặn API, bóc tách trực tiếp trang chủ thông qua Proxy công cộng
+  # 2. Nếu API không mở, cào HTML bằng Impersonate Fingerprint
   if not matches:
-    print('Thử lấy dữ liệu thông qua Proxy...')
-    proxy_urls = [
-        'https://sutbongtve.cc/',
-        'https://api.allorigins.win/raw?url=https://sutbongtve.cc/',
-    ]
-    for p_url in proxy_urls:
-      try:
-        res = session.get(p_url, timeout=12)
-        if res.status_code == 200:
-          html = res.text
-          match_json = re.search(
-              r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.DOTALL
+    try:
+      res = session.get('https://sutbongtve.cc/', headers=headers, timeout=12)
+      if res.status_code == 200:
+        html = res.text
+        # Quét state JSON nhúng sẵn trong script
+        script_data = re.search(
+            r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.DOTALL
+        )
+        if script_data:
+          st = json.loads(script_data.group(1))
+          matches = (
+              st.get('matches') or st.get('matchList') or st.get('list') or []
           )
-          if match_json:
-            st = json.loads(match_json.group(1))
-            matches = (
-                st.get('matches') or st.get('matchList') or st.get('list') or []
-            )
-            if matches:
-              break
-      except Exception:
-        continue
+
+        # Nếu không có state JSON, bóc tách bằng BeautifulSoup
+        if not matches:
+          soup = BeautifulSoup(html, 'html.parser')
+          cards = soup.select(
+              'div[class*="match"], div[class*="game"], a[href*="truc-tiep"]'
+          )
+          for card in cards:
+            text = card.get_text(separator=' ', strip=True)
+            if 'vs' in text.lower():
+              imgs = card.find_all('img')
+              logo = imgs[0]['src'] if imgs and 'src' in imgs[0].attrs else ''
+              matches.append({
+                  'raw_text': text,
+                  'logo': logo,
+                  'home_name': 'Đội A',
+                  'away_name': 'Đội B',
+                  'match_time': datetime.now(TZ_VN).strftime('%H:%M'),
+                  'stream_url': 'https://sutbongtve.cc/',
+              })
+    except Exception as e:
+      print(f'Lỗi cào HTML: {e}')
 
   return matches
 
@@ -135,7 +121,7 @@ def generate_m3u(matches_data):
   m3u_lines = ['#EXTM3U x-tvg-url=""']
 
   if not matches_data:
-    print('CẢNH BÁO: Chưa thu thập được trận đấu.')
+    print('Không tìm thấy dữ liệu từ Sút Bóng TV.')
     return '\n'.join(m3u_lines)
 
   print(f'Thu thập thành công {len(matches_data)} mục.')
@@ -190,7 +176,7 @@ def generate_m3u(matches_data):
       sport_type = item.get('sport_type') or item.get('sport') or 'football'
       sport_icon = get_sport_icon(sport_type)
 
-      # Bóc tách danh sách các luồng phát / BLV
+      # Bóc tách danh sách các BLV (THOMAS, BLV TAP, ZIDANE...)
       links = (
           item.get('links')
           or item.get('play_urls')
