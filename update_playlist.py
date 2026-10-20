@@ -28,140 +28,114 @@ def scrape_sutbong_playlist():
     )
     page = context.new_page()
 
-    # Bắt tất cả các luồng phát .m3u8 thực tế từ network của trang web
-    captured_streams = {}
+    # Bắt trực tiếp link luồng m3u8 từ network request
+    active_m3u8_links = {}
 
     def handle_request(request):
       url = request.url
       if '.m3u8' in url or 'pull.' in url:
-        # Lưu lại link m3u8 theo dạng domain hoặc query
-        captured_streams['active_m3u8'] = url
+        active_m3u8_links['url'] = url
 
     page.on('request', handle_request)
 
     try:
-      print('Đang truy cập trang chủ sutbongtve.cc...')
+      print('Đang mở trang chủ sutbongtve.cc...')
       page.goto(
           'https://sutbongtve.cc/', wait_until='domcontentloaded', timeout=30000
       )
-      page.wait_for_timeout(8000)  # Chờ trang render dữ liệu động hoàn toàn
+      page.wait_for_timeout(8000)
 
-      # Tìm tất cả các liên kết dẫn đến trang xem trực tiếp trận đấu
-      match_links = page.locator('a[href*="/truc-tiep/"]').all()
-      unique_urls = set()
-      for link in match_links:
-        href = link.get_attribute('href')
-        if href:
-          full_url = (
-              f'https://sutbongtve.cc{href}'
-              if href.startswith('/')
-              else href
-          )
-          unique_urls.add(full_url)
+      # Quét các khối trận đấu cụ thể trên trang chủ
+      match_cards = page.locator('div[class*="match"], div[class*="game"]').all()
+      match_items = []
 
-      print(f'Tìm thấy {len(unique_urls)} trận đấu đang phát trực tiếp.')
-
-      # Nếu không quét được link trực tiếp, quét toàn bộ card giao diện
-      if not unique_urls:
-        cards = page.locator('div[class*="match"], div[class*="game"]').all()
-        for card in cards:
-          try:
-            txt = card.inner_text()
-            if 'vs' in txt.lower():
-              link_el = card.locator('a').first
-              if link_el.count() > 0:
-                h = link_el.get_attribute('href')
-                if h:
-                  unique_urls.add(
-                      f'https://sutbongtve.cc{h}'
-                      if h.startswith('/')
-                      else h
-                  )
-          except Exception:
-            continue
-
-      # Duyệt qua từng trang chi tiết trận đấu để bóc tách thông tin chuẩn xác
-      for match_url in list(unique_urls)[:20]:
+      for card in match_cards:
         try:
-          print(f'Đang phân tích trận: {match_url}')
+          txt = card.inner_text()
+          if 'vs' in txt.lower():
+            link_el = card.locator('a[href*="/truc-tiep/"]').first
+            if link_el.count() > 0:
+              href = link_el.get_attribute('href')
+              full_url = (
+                  f'https://sutbongtve.cc{href}'
+                  if href.startswith('/')
+                  else href
+              )
+              if full_url not in match_items:
+                match_items.append(full_url)
+        except Exception:
+          continue
+
+      print(
+          f'Tìm thấy {len(match_items)} trận đấu. Đang trích xuất chi tiết...'
+      )
+
+      # Nếu không quét được qua card, lấy các đường dẫn trực tiếp từ trang
+      if not match_items:
+        links = page.locator('a[href*="/truc-tiep/"]').all()
+        for l in links:
+          h = l.get_attribute('href')
+          if h:
+            u = f'https://sutbongtve.cc{h}' if h.startswith('/') else h
+            if u not in match_items:
+              match_items.append(u)
+
+      # Duyệt qua từng trang chi tiết trận đấu
+      for match_url in match_items[:25]:
+        try:
           detail_page = context.new_page()
           detail_page.goto(
               match_url, wait_until='domcontentloaded', timeout=15000
           )
           detail_page.wait_for_timeout(4000)
 
-          # Lấy tiêu đề trang (thường chứa tên 2 đội, ví dụ: "Deportivo Pasto vs Alianza...")
-          title_text = detail_page.title()
+          # Lấy tiêu đề trang chính xác để tách tên 2 đội
+          title = detail_page.title()
           home, away = 'Đội Nhà', 'Đội Khách'
 
-          if 'vs' in title_text.lower():
-            parts = re.split(r'\s+vs\s+|-', title_text, flags=re.IGNORECASE)
+          clean_title = re.sub(
+              r'Sutbong TV.*?-|Xem trực tiếp.*?-', '', title, flags=re.IGNORECASE
+          )
+          if 'vs' in clean_title.lower():
+            parts = re.split(
+                r'\s+vs\s+|\s+-\s+', clean_title, flags=re.IGNORECASE
+            )
             if len(parts) >= 2:
               home = clean_text(parts[0])
               away = clean_text(parts[1])
 
-          # Lấy logo đội bóng từ trang chi tiết
+          # Lấy logo chuẩn
           img_el = detail_page.locator('img').first
           logo = (
               img_el.get_attribute('src')
               if img_el.count() > 0
-              else 'https://sutbongtve.cc/wp-content/uploads/2026/08/logo-subongtv-vin.png'
+              else 'https://sutbongtve.cc/wp-content/uploads/2026/08/logo-subongtv-vin-1024x576.png'
           )
           if logo and logo.startswith('/'):
             logo = f'https://sutbongtve.cc{logo}'
 
-          # Lấy danh sách tên các BLV (THOMAS, ZIDANE, BLV TAP, MESSI...)
-          blv_elements = detail_page.locator(
-              'button, div[class*="blv"], div[class*="tab"], span[class*="name"]'
+          # Lấy danh sách BLV thực tế đang hiển thị trên các nút bấm của trận này
+          blv_buttons = detail_page.locator(
+              'button, div[class*="blv"], div[class*="tab"]'
           ).all()
           blv_names = []
 
-          for el in blv_elements:
-            t = clean_text(el.inner_text())
+          for btn in blv_buttons:
+            b_text = clean_text(btn.inner_text())
             if (
-                t
-                and len(t) < 25
-                and (
-                    'blv' in t.lower()
-                    or t.isupper()
-                    or t
-                    in [
-                        'THOMAS',
-                        'ZIDANE',
-                        'TAP',
-                        'RICKHANTER',
-                        'ROSI',
-                        'KAN',
-                        'ALEX',
-                        'COCA',
-                        'HUCK',
-                        'PEANUT',
-                        'CUỘI',
-                        'VIP',
-                        'HEHE',
-                        'CÒ',
-                        'RYO',
-                        'LOGAN',
-                        'MESSI',
-                        'ĐỐM',
-                        'TOMIA',
-                        'YONE',
-                        'XO',
-                    ]
-                )
+                b_text
+                and len(b_text) < 20
+                and b_text
+                not in [
+                    'CHAT',
+                    'THỐNG KÊ',
+                    'ĐỘI HÌNH',
+                    'DIỄN BIẾN',
+                    'BẢNG XẾP HẠNG',
+                ]
             ):
-              if (
-                  t
-                  not in [
-                      'CHAT',
-                      'THỐNG KÊ',
-                      'ĐỘI HÌNH',
-                      'DIỄN BIẾN',
-                      'BẢNG XẾP HẠNG',
-                  ]
-                  and t not in blv_names
-              ):
-                blv_names.append(t)
+              if b_text not in blv_names:
+                blv_names.append(b_text)
 
           if not blv_names:
             blv_names = ['BLV Sút Bóng']
@@ -170,8 +144,8 @@ def scrape_sutbong_playlist():
           time_str = now_vn.strftime('%H:%M')
           date_str = now_vn.strftime('%d/%m')
 
-          # Lấy link stream m3u8 thực tế nếu bắt được, nếu không dùng match_url
-          stream_link = captured_streams.get('active_m3u8', match_url)
+          # Lấy link m3u8 thực tế hoặc fallback về url chi tiết
+          stream_url = active_m3u8_links.get('url', match_url)
 
           for blv in blv_names:
             channels_data.append({
@@ -181,12 +155,12 @@ def scrape_sutbong_playlist():
                 'date': date_str,
                 'blv': blv,
                 'logo': logo,
-                'url': stream_link,
+                'url': stream_url,
             })
 
           detail_page.close()
         except Exception as e:
-          print(f'Lỗi quét trang chi tiết {match_url}: {e}')
+          print(f'Lỗi phân tích trận đấu: {e}')
 
     except Exception as e:
       print(f'Lỗi tổng quan: {e}')
@@ -199,10 +173,10 @@ def scrape_sutbong_playlist():
 def generate_m3u(channels):
   m3u_lines = ['#EXTM3U x-tvg-url=""']
   if not channels:
-    print('Không thu thập được kênh nào.')
+    print('Không có kênh nào được tạo.')
     return '\n'.join(m3u_lines)
 
-  print(f'Đang tổng hợp {len(channels)} luồng phát...')
+  print(f'Tổng hợp thành công {len(channels)} luồng phát...')
   seen = set()
 
   for ch in channels:
@@ -226,11 +200,10 @@ def generate_m3u(channels):
 
 if __name__ == '__main__':
   data = scrape_sutbong_playlist()
-  print(f'Tổng số luồng phát hợp lệ: {len(data)}')
   content = generate_m3u(data)
 
   with open('playlist.m3u', 'w', encoding='utf-8') as f:
     f.write(content)
 
-  print('Đã ghi thành công file playlist.m3u!')
+  print('Đã ghi file playlist.m3u hoàn tất!')
   
