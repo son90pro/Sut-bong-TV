@@ -1,14 +1,14 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import re
-from curl_cffi import requests
+from playwright.sync_api import sync_playwright
 import pytz
 
 TZ_VN = pytz.timezone('Asia/Ho_Chi_Minh')
 
 
 def parse_timestamp(ts):
-  """Quy đổi thời gian sang chuẩn múi giờ Việt Nam UTC+7."""
+  """Chuyển đổi timestamp/chuỗi giờ sang giờ Việt Nam (UTC+7)."""
   try:
     if isinstance(ts, (int, float)) or (isinstance(ts, str) and ts.isdigit()):
       ts_val = float(ts)
@@ -27,142 +27,130 @@ def parse_timestamp(ts):
   return now_vn.strftime('%H:%M'), now_vn.strftime('%d/%m')
 
 
-def get_sport_icon(sport_text):
-  sport = str(sport_text).lower()
-  if 'basket' in sport or 'rổ' in sport:
+def get_sport_icon(sport_type):
+  s = str(sport_type).lower()
+  if 'basket' in s or 'rổ' in s:
     return '🏀'
-  elif 'tennis' in sport or 'vợt' in sport:
+  elif 'tennis' in s or 'vợt' in s:
     return '🎾'
-  elif 'volley' in sport or 'chuyền' in sport:
+  elif 'volley' in s or 'chuyền' in s:
     return '🏐'
-  elif 'badminton' in sport or 'cầu lông' in sport:
+  elif 'badminton' in s or 'cầu lông' in s:
     return '🏸'
   return '⚽'
 
 
-def fetch_sutbong_data():
-  session = requests.Session(impersonate='chrome120')
+def fetch_matches_with_aes_decryption():
+  raw_matches = []
 
-  # 1. Gửi request xác thực tracking API theo đúng chuẩn của website
-  track_url = 'https://api.rainbowbridge.fit/track'
-  track_payload = {
-      'session_id': 'edd08ea4-67db-4950-a90a-441f7db72d14',
-      'user_cookie': 'd4d05370-ba46-4394-b1fe-61d51da8df28',
-      'url': 'https://sutbongtve.cc/',
-      'hostname': 'sutbongtve.cc',
-      'referer': 'https://www.google.com/',
-      'browser': (
-          'Mozilla/5.0 (Android 16; Mobile; rv:157.0) Gecko/157.0'
-          ' Firefox/157.0'
-      ),
-      'is_bot': 0,
-  }
+  with sync_playwright() as p:
+    # Mở Chromium với Flag bỏ qua CORS để nhận luồng giải mã AES
+    browser = p.chromium.launch(
+        headless=True, args=['--disable-web-security', '--no-sandbox']
+    )
+    context = browser.new_context(
+        user_agent=(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            ' (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        ),
+        viewport={'width': 1280, 'height': 720},
+    )
+    page = context.new_page()
 
-  headers = {
-      'User-Agent': (
-          'Mozilla/5.0 (Android 16; Mobile; rv:157.0) Gecko/157.0'
-          ' Firefox/157.0'
-      ),
-      'Referer': 'https://sutbongtve.cc/',
-      'Origin': 'https://sutbongtve.cc',
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/plain, */*',
-  }
+    # Bắt tất cả response JSON sau khi trình duyệt đã giải mã AES thành công
+    def handle_response(response):
+      try:
+        url = response.url.lower()
+        if (
+            'aes-pull' in url
+            or 'wp-json' in url
+            or 'match' in url
+            or 'sport' in url
+        ):
+          if (
+              response.status == 200
+              and 'json' in response.headers.get('content-type', '').lower()
+          ):
+            res_data = response.json()
+            if isinstance(res_data, list):
+              raw_matches.extend(res_data)
+            elif isinstance(res_data, dict):
+              arr = (
+                  res_data.get('data')
+                  or res_data.get('matches')
+                  or res_data.get('list')
+                  or res_data.get('rows')
+              )
+              if isinstance(arr, list):
+                raw_matches.extend(arr)
+      except Exception:
+        pass
 
-  try:
-    session.post(track_url, json=track_payload, headers=headers, timeout=10)
-  except Exception:
-    pass
+    page.on('response', handle_response)
 
-  matches = []
-
-  # 2. Quét qua các nguồn API soco-engine / sportdb thực tế của hệ thống
-  api_endpoints = [
-      'https://sutbongtve.cc/wp-json/soco/v1/aes-pull',
-      'https://sutbongtve.cc/wp-json/soco/v1/matches',
-      'https://api.rainbowbridge.fit/api/matches',
-      'https://sportdb.live/api/matches',
-      'https://sutbongtve.cc/json/matches.json',
-  ]
-
-  for url in api_endpoints:
     try:
-      res = session.get(url, headers=headers, timeout=10)
-      if res.status_code == 200:
-        data = res.json()
-        if isinstance(data, list) and len(data) > 0:
-          matches = data
-          break
-        elif isinstance(data, dict):
-          arr = (
-              data.get('data')
-              or data.get('matches')
-              or data.get('list')
-              or data.get('key')
-              or []
-          )
-          if isinstance(arr, list) and len(arr) > 0:
-            matches = arr
-            break
-          elif isinstance(arr, str):
-            # Nếu trả về dạng token/key cấu hình
-            pass
-    except Exception:
-      continue
-
-  # 3. Lấy trực tiếp trang chủ và trích xuất toàn bộ state khởi tạo
-  if not matches:
-    try:
-      res = session.get(
-          'https://sutbongtve.cc/', headers=headers, timeout=15
+      print('Đang mở sutbongtve.cc và kích hoạt giải mã AES...')
+      # Dùng commit/domcontentloaded để không bị timeout
+      page.goto(
+          'https://sutbongtve.cc/', wait_until='domcontentloaded', timeout=25000
       )
-      if res.status_code == 200:
-        html = res.text
-        match_json = re.search(
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.DOTALL
-        )
-        if match_json:
-          state_data = json.loads(match_json.group(1))
-          matches = (
-              state_data.get('matches')
-              or state_data.get('matchList')
-              or state_data.get('list')
-              or []
-          )
+      page.wait_for_timeout(7000)  # Chờ JS chạy giải mã AES và render DOM
 
-        # Nếu không có state, dùng regex quét các luồng trận đấu trong HTML
-        if not matches:
-          # Fallback tạo mục chung từ trang chủ nếu dữ liệu động ẩn qua JS bảo vệ
-          matches.append({
-              'home_name': 'Sút Bóng TV Trực Tiếp',
-              'away_name': 'Hôm Nay',
-              'match_time': datetime.now(TZ_VN).strftime('%H:%M'),
-              'logo': (
-                  'https://sutbongtve.cc/wp-content/uploads/2026/08/logo-subongtv-vin.png'
-              ),
-              'stream_url': 'https://sutbongtve.cc/',
-              'commentator': 'BLV Sút Bóng',
-              'quality': 'Full HD',
-          })
+      # Nếu response mạng chưa bắt đủ, trích xuất dữ liệu từ DOM đã render hoàn chỉnh
+      if not raw_matches:
+        print('Bóc tách dữ liệu trực tiếp từ DOM đã giải mã...')
+        cards = page.locator(
+            'div[class*="match"], div[class*="game"], div[class*="soco"]'
+        ).all()
+        for card in cards:
+          try:
+            txt = card.inner_text()
+            if 'vs' in txt.lower() and len(txt) < 300:
+              lines = [l.strip() for l in txt.split('\n') if l.strip()]
+              imgs = card.locator('img').all()
+              logo = (
+                  imgs[0].get_attribute('src')
+                  if imgs and len(imgs) > 0
+                  else ''
+              )
+
+              # Lấy tên BLV từ card nếu có
+              blv_match = re.search(r'BLV\s+[\w\s]+', txt, re.IGNORECASE)
+              blv_name = blv_match.group(0) if blv_match else 'BLV Sút Bóng'
+
+              raw_matches.append({
+                  'home_name': lines[0] if len(lines) > 0 else 'Đội A',
+                  'away_name': lines[2] if len(lines) > 2 else 'Đội B',
+                  'match_time': datetime.now(TZ_VN).strftime('%H:%M'),
+                  'logo': logo,
+                  'stream_url': 'https://sutbongtve.cc/',
+                  'commentator': blv_name,
+                  'quality': 'FHD',
+              })
+          except Exception:
+            continue
+
     except Exception as e:
-      print(f'Lỗi kết nối trang: {e}')
+      print(f'Lỗi Playwright: {e}')
+    finally:
+      browser.close()
 
-  return matches
+  return raw_matches
 
 
 def generate_m3u(matches):
   m3u_lines = ['#EXTM3U x-tvg-url=""']
 
   if not matches:
-    print('Không có dữ liệu trận đấu.')
+    print('Không tìm thấy trận đấu nào.')
     return '\n'.join(m3u_lines)
 
-  print(f'Đang tổng hợp {len(matches)} mục hiển thị...')
+  print(f'Đang bóc tách {len(matches)} trận đấu...')
   seen = set()
 
   for item in matches:
     try:
-      if isinstance(item, str):
+      if not isinstance(item, dict):
         continue
 
       home = (
@@ -173,7 +161,7 @@ def generate_m3u(matches):
               if isinstance(item.get('home'), dict)
               else ''
           )
-          or 'Đội Nhà'
+          or item.get('home')
       )
       away = (
           item.get('away_name')
@@ -183,8 +171,11 @@ def generate_m3u(matches):
               if isinstance(item.get('away'), dict)
               else ''
           )
-          or 'Đội Khách'
+          or item.get('away')
       )
+
+      if not home or not away or home == away:
+        continue
 
       logo = (
           item.get('home_logo')
@@ -222,7 +213,7 @@ def generate_m3u(matches):
             or 'https://sutbongtve.cc/'
         )
         blv = item.get('commentator') or item.get('blv') or 'BLV Sút Bóng'
-        links = [{'url': stream_url, 'blv': blv, 'quality': 'Full HD'}]
+        links = [{'url': stream_url, 'blv': blv, 'quality': 'FHD'}]
 
       for idx, link in enumerate(links, 1):
         if isinstance(link, dict):
@@ -238,11 +229,11 @@ def generate_m3u(matches):
               or link.get('name')
               or f'BLV {idx}'
           )
-          quality = link.get('quality') or 'Full HD'
+          quality = link.get('quality') or 'FHD'
         else:
           s_url = str(link)
           blv_name = f'BLV {idx}'
-          quality = 'Full HD'
+          quality = 'FHD'
 
         if not s_url:
           continue
@@ -252,6 +243,8 @@ def generate_m3u(matches):
           continue
         seen.add(unique_key)
 
+        # Định dạng chuẩn giao diện mẫu:
+        # 06:00 20/10 ⚽ Corinthians vs Vitória (BLV Siêu Nhí) [FHD]
         title_display = f'{time_str} {date_str} {sport_icon} {home} vs {away} ({blv_name}) [{quality}]'
 
         m3u_lines.append(
@@ -261,17 +254,17 @@ def generate_m3u(matches):
         m3u_lines.append(s_url)
 
     except Exception as e:
-      print(f'Lỗi xử lý trận đấu: {e}')
+      print(f'Lỗi xử lý mục: {e}')
 
   return '\n'.join(m3u_lines)
 
 
 if __name__ == '__main__':
-  matches_data = fetch_sutbong_data()
+  matches_data = fetch_matches_with_aes_decryption()
   m3u_content = generate_m3u(matches_data)
 
   with open('playlist.m3u', 'w', encoding='utf-8') as f:
     f.write(m3u_content)
 
-  print('Đã cập nhật hoàn tất file playlist.m3u!')
+  print('Đã bóc tách thành công danh sách trận đấu thực tế vào playlist.m3u!')
   
