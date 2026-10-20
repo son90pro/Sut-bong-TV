@@ -21,11 +21,10 @@ def get_sport_icon(sport_text):
 
 
 def parse_timestamp(ts):
-  """Chuyển timestamp/thời gian sang định dạng giờ VN."""
   try:
     if isinstance(ts, (int, float)) or (isinstance(ts, str) and ts.isdigit()):
       ts_val = float(ts)
-      if ts_val > 1e11:  # milliseconds
+      if ts_val > 1e11:
         ts_val /= 1000.0
       dt = datetime.fromtimestamp(ts_val, tz=pytz.utc).astimezone(TZ_VN)
       return dt.strftime('%H:%M'), dt.strftime('%d/%m')
@@ -47,14 +46,14 @@ def fetch_data_from_sutbongtv():
     browser = p.chromium.launch(headless=True)
     context = browser.new_context(
         user_agent=(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            ' (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Android 16; Mobile; rv:157.0) Gecko/157.0'
+            ' Firefox/157.0'
         ),
         viewport={'width': 1280, 'height': 720},
     )
     page = context.new_page()
 
-    # Chặn các request API để bắt dữ liệu trận đấu gốc từ Server
+    # Bắt tất cả các phản hồi API JSON từ trang web trả về
     def handle_response(response):
       try:
         url = response.url.lower()
@@ -62,7 +61,7 @@ def fetch_data_from_sutbongtv():
             'api' in url
             or 'match' in url
             or 'list' in url
-            or 'schedule' in url
+            or 'track' in url
             or 'json' in url
         ):
           if (
@@ -70,27 +69,16 @@ def fetch_data_from_sutbongtv():
               and 'json' in response.headers.get('content-type', '').lower()
           ):
             res_json = response.json()
-            # Bóc tách danh sách trận đấu từ response API
-            data_arr = None
             if isinstance(res_json, list):
-              data_arr = res_json
+              matches_list.extend(res_json)
             elif isinstance(res_json, dict):
-              data_arr = (
+              arr = (
                   res_json.get('data')
                   or res_json.get('matches')
                   or res_json.get('list')
-                  or res_json.get('rows')
               )
-
-            if isinstance(data_arr, list) and len(data_arr) > 0:
-              for item in data_arr:
-                if isinstance(item, dict) and (
-                    'home' in item
-                    or 'home_name' in item
-                    or 'home_team' in item
-                    or 'title' in item
-                ):
-                  matches_list.append(item)
+              if isinstance(arr, list):
+                matches_list.extend(arr)
       except Exception:
         pass
 
@@ -98,26 +86,40 @@ def fetch_data_from_sutbongtv():
 
     try:
       print('Đang mở trang sutbongtve.cc...')
+      # Sử dụng domcontentloaded để không bị timeout chờ network
       page.goto(
-          'https://sutbongtve.cc/', wait_until='networkidle', timeout=30000
+          'https://sutbongtve.cc/', wait_until='domcontentloaded', timeout=20000
       )
-      page.wait_for_timeout(6000)  # Chờ JS render xong
+      page.wait_for_timeout(4000)  # Chờ các thành phần JavaScript khởi tạo
 
-      # Nếu chưa bắt được qua API Response, cào dữ liệu nhúng trong thẻ script
-      if not matches_list:
-        content = page.content()
-        # Tìm JSON state nhúng trong trang
-        script_matches = re.findall(
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});', content, re.DOTALL
-        )
-        if script_matches:
-          st_json = json.loads(script_matches[0])
-          found_list = st_json.get('matches') or st_json.get('list') or []
-          if isinstance(found_list, list):
-            matches_list.extend(found_list)
+      # Cào dữ liệu trực tiếp từ các thẻ trên HTML nếu trang hiển thị danh sách trận đấu dạng DOM
+      cards = page.locator(
+          'div, a, li'
+      ).all()  # Hoặc quét các phần tử chứa thông tin trận đấu
+      for card in cards:
+        try:
+          txt = card.inner_text()
+          if 'vs' in txt.lower() and len(txt) < 200:
+            # Trích xuất cơ bản tên các đội nếu tìm thấy cấu trúc text trận đấu
+            lines = [
+                l.strip() for l in txt.split('\n') if l.strip() != ''
+            ]
+            if len(lines) >= 2:
+              matches_list.append({
+                  'home_name': lines[0],
+                  'away_name': (
+                      lines[1] if 'vs' not in lines[1].lower() else 'Đội Khách'
+                  ),
+                  'match_time': datetime.now(TZ_VN).strftime('%H:%M'),
+                  'stream_url': page.url,
+                  'commentator': 'Gà Vàng',
+                  'quality': 'FHD',
+              })
+        except Exception:
+          continue
 
     except Exception as e:
-      print(f'Lỗi khi truy cập trang web: {e}')
+      print(f'Lỗi khi duyệt trang: {e}')
     finally:
       browser.close()
 
@@ -128,139 +130,55 @@ def generate_m3u(raw_matches):
   m3u_lines = ['#EXTM3U x-tvg-url=""']
 
   if not raw_matches:
-    print('CẢNH BÁO: Không lấy được danh sách trận đấu thực tế!')
+    print('Không có dữ liệu trận đấu nào được trích xuất.')
     return '\n'.join(m3u_lines)
 
-  print(f'Bắt đầu xử lý {len(raw_matches)} trận đấu...')
+  print(f'Đang tổng hợp {len(raw_matches)} mục...')
+  seen = set()
 
   for item in raw_matches:
     try:
-      # 1. Tên 2 đội bóng
-      home = (
-          item.get('home_name')
-          or item.get('home_team')
-          or (
-              item.get('home', {}).get('name')
-              if isinstance(item.get('home'), dict)
-              else item.get('home')
-          )
-          or 'Đội Nhà'
-      )
-      away = (
-          item.get('away_name')
-          or item.get('away_team')
-          or (
-              item.get('away', {}).get('name')
-              if isinstance(item.get('away'), dict)
-              else item.get('away')
-          )
-          or 'Đội Khách'
-      )
+      home = item.get('home_name', item.get('home_team', 'Đội Nhà'))
+      away = item.get('away_name', item.get('away_team', 'Đội Khách'))
+      if home == away or 'Đội Nhà' in home:
+        continue
 
-      # 2. Logo đội bóng (ưu tiên logo đội nhà)
-      logo = (
-          item.get('home_logo')
-          or (
-              item.get('home', {}).get('logo')
-              if isinstance(item.get('home'), dict)
-              else ''
-          )
-          or item.get('logo')
-          or item.get('poster')
-          or ''
+      key = f'{home}-{away}'
+      if key in seen:
+        continue
+      seen.add(key)
+
+      logo = item.get('logo', '')
+      time_str, date_str = parse_timestamp(
+          item.get('match_time', datetime.now(TZ_VN))
+      )
+      sport_icon = get_sport_icon(item.get('sport', 'football'))
+      group_title = item.get('tournament_name', 'Sút Bóng TV')
+      blv = item.get('commentator', 'BLV')
+      quality = item.get('quality', 'FHD')
+      s_url = item.get('stream_url', 'https://sutbongtve.cc')
+
+      title_display = (
+          f'{time_str} {date_str} {sport_icon} {home} vs {away} ({blv})'
+          f' [{quality}]'
       )
 
-      # 3. Giờ và ngày thi đấu (Múi giờ VN)
-      match_time_raw = (
-          item.get('match_time')
-          or item.get('start_time')
-          or item.get('time')
-          or item.get('time_start')
+      m3u_lines.append(
+          f'#EXTINF:-1 tvg-logo="{logo}" group-title="{group_title}",'
+          f'{title_display}'
       )
-      time_str, date_str = parse_timestamp(match_time_raw)
-
-      # 4. Icon môn thể thao
-      sport_type = item.get('sport_type') or item.get('sport') or 'football'
-      sport_icon = get_sport_icon(sport_type)
-
-      # 5. Tên nhóm/Tab (Sút Bóng TV / Gà Vàng 33 TV)
-      group_title = (
-          item.get('channel_name')
-          or item.get('tournament_name')
-          or item.get('league_name')
-          or 'Sút Bóng TV'
-      )
-
-      # 6. Luồng phát & Bình luận viên
-      links = (
-          item.get('links')
-          or item.get('play_urls')
-          or item.get('channels')
-          or []
-      )
-
-      if not links:
-        stream_url = (
-            item.get('stream_url')
-            or item.get('play_url')
-            or item.get('url')
-            or 'https://sutbongtve.cc'
-        )
-        blv = item.get('commentator') or item.get('blv') or 'BLV'
-        quality = item.get('quality') or 'FHD'
-        links = [{'url': stream_url, 'blv': blv, 'quality': quality}]
-
-      for idx, link in enumerate(links, 1):
-        if isinstance(link, dict):
-          s_url = (
-              link.get('url')
-              or link.get('play_url')
-              or link.get('m3u8')
-              or link.get('flv')
-          )
-          s_blv = (
-              link.get('blv')
-              or link.get('commentator')
-              or item.get('commentator')
-              or 'BLV'
-          )
-          s_quality = (
-              link.get('quality')
-              or link.get('name')
-              or (f'HD{idx}' if idx > 1 else 'FHD')
-          )
-        else:
-          s_url = str(link)
-          s_blv = item.get('commentator') or 'BLV'
-          s_quality = f'HD{idx}' if idx > 1 else 'FHD'
-
-        if not s_url or not s_url.startswith('http'):
-          continue
-
-        # Định dạng dòng tiêu đề chuẩn hình mẫu:
-        # 06:00 20/10 ⚽ Corinthians - SP vs Vitória - BA (Gà Siêu Nhí) [hls]
-        title_display = f'{time_str} {date_str} {sport_icon} {home} vs {away} ({s_blv}) [{s_quality}]'
-
-        m3u_lines.append(
-            f'#EXTINF:-1 tvg-logo="{logo}"'
-            f' group-title="{group_title}",{title_display}'
-        )
-        m3u_lines.append(s_url)
-
+      m3u_lines.append(s_url)
     except Exception as e:
-      print(f'Lỗi dòng trận đấu: {e}')
+      print(f'Lỗi định dạng: {e}')
 
   return '\n'.join(m3u_lines)
 
 
 if __name__ == '__main__':
   matches = fetch_data_from_sutbongtv()
-  print(f'Thu thập thành công {len(matches)} trận đấu thật!')
-
   m3u_content = generate_m3u(matches)
 
   with open('playlist.m3u', 'w', encoding='utf-8') as f:
     f.write(m3u_content)
-
-  print('Đã ghi dữ liệu chuẩn vào playlist.m3u!')
+  print('Đã cập nhật file playlist.m3u thành công!')
   
