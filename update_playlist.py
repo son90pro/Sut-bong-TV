@@ -1,14 +1,37 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import re
-from playwright.sync_api import sync_playwright
 import pytz
+import requests
 
 TZ_VN = pytz.timezone('Asia/Ho_Chi_Minh')
 
+HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ' (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    ),
+    'Referer': 'https://sutbongtve.cc/',
+    'Origin': 'https://sutbongtve.cc',
+    'Accept': 'application/json, text/plain, */*',
+}
+
+
+def get_sport_icon(sport_text):
+  sport = str(sport_text).lower()
+  if 'basket' in sport or 'rổ' in sport:
+    return '🏀'
+  elif 'tennis' in sport or 'vợt' in sport:
+    return '🎾'
+  elif 'volley' in sport or 'chuyền' in sport:
+    return '🏐'
+  elif 'badminton' in sport or 'cầu lông' in sport:
+    return '🏸'
+  return '⚽'
+
 
 def parse_timestamp(ts):
-  """Quy đổi thời gian trận đấu sang giờ Việt Nam."""
+  """Chuyển thời gian sang múi giờ Việt Nam UTC+7."""
   try:
     if isinstance(ts, (int, float)) or (isinstance(ts, str) and ts.isdigit()):
       ts_val = float(ts)
@@ -27,166 +50,178 @@ def parse_timestamp(ts):
   return now_vn.strftime('%H:%M'), now_vn.strftime('%d/%m')
 
 
-def fetch_matches_and_m3u8():
-  extracted_channels = []
+def fetch_data():
+  session = requests.Session()
+  session.headers.update(HEADERS)
+  matches = []
 
-  with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    context = browser.new_context(
-        user_agent=(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            ' (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        ),
-        viewport={'width': 1280, 'height': 720},
-    )
-    page = context.new_page()
+  # Danh sách các API endpoint trực tiếp của hệ thống Sút Bóng TV
+  api_endpoints = [
+      'https://sutbongtve.cc/api/v1/matches',
+      'https://sutbongtve.cc/api/matches',
+      'https://api.rainbowbridge.fit/api/matches',
+      'https://sutbongtve.cc/json/matches.json',
+  ]
 
-    # Bắt tất cả các luồng phát .m3u8 phát ra trong mạng (network)
-    captured_m3u8 = []
-
-    def handle_request(request):
-      url = request.url
-      if '.m3u8' in url or 'pull.' in url:
-        captured_m3u8.append(url)
-
-    page.on('request', handle_request)
-
+  for api_url in api_endpoints:
     try:
-      print('Đang truy cập trang chủ sutbongtve.cc...')
-      page.goto(
-          'https://sutbongtve.cc/', wait_until='domcontentloaded', timeout=25000
-      )
-      page.wait_for_timeout(5000)
-
-      # 1. Thu thập dữ liệu trận đấu và danh sách BLV từ DOM / API
-      match_cards = page.locator(
-          'div[class*="match"], div[class*="game"], a[href*="truc-tiep"]'
-      ).all()
-      match_links = []
-
-      for card in match_cards:
-        try:
-          txt = card.inner_text()
-          if 'vs' in txt.lower() and len(txt) < 300:
-            href = card.get_attribute('href')
-            if href:
-              full_url = (
-                  f'https://sutbongtve.cc{href}'
-                  if href.startswith('/')
-                  else href
-              )
-              if full_url not in match_links:
-                match_links.append(full_url)
-        except Exception:
-          continue
-
-      print(f'Tìm thấy {len(match_links)} trang trận đấu chi tiết.')
-
-      # 2. Duyệt qua các trận đấu đang phát để bóc tách từng BLV & link .m3u8 trực tiếp
-      for match_url in match_links[:15]:  # Giới hạn lấy các trận hot đang/sắp diễn ra
-        try:
-          print(f'Đang quét luồng phát trận: {match_url}')
-          captured_m3u8.clear()
-          detail_page = context.new_page()
-          detail_page.on('request', handle_request)
-
-          detail_page.goto(
-              match_url, wait_until='domcontentloaded', timeout=15000
+      res = session.get(api_url, timeout=10)
+      if res.status_code == 200:
+        data = res.json()
+        if isinstance(data, list):
+          matches = data
+          break
+        elif isinstance(data, dict):
+          matches = (
+              data.get('data') or data.get('matches') or data.get('list') or []
           )
-          detail_page.wait_for_timeout(4000)
+          if matches:
+            break
+    except Exception:
+      continue
 
-          # Lấy tên hai đội
-          page_title = detail_page.title()
-          title_parts = re.split(r'vs|-', page_title, flags=re.IGNORECASE)
-          home_team = title_parts[0].strip() if len(title_parts) > 0 else 'Đội A'
-          away_team = title_parts[1].strip() if len(title_parts) > 1 else 'Đội B'
-
-          # Lấy danh sách các nút BLV (THOMAS, BLV TAP, ZIDANE...)
-          blv_elements = detail_page.locator(
-              'button, div[class*="blv"], div[class*="tab"], div[class*="btn"]'
-          ).all()
-          blv_names = []
-
-          for el in blv_elements:
-            t = el.inner_text().strip()
-            if t and len(t) < 20 and ('blv' in t.lower() or t.isupper()):
-              if t not in blv_names and t not in ['CHAT', 'THỐNG KÊ', 'ĐỘI HÌNH', 'DIỄN BIẾN']:
-                blv_names.append(t)
-
-          if not blv_names:
-            blv_names = ['Sút Bóng TV']
-
-          # Nếu tìm thấy link .m3u8 thực tế từ network
-          valid_m3u8 = [u for u in captured_m3u8 if '.m3u8' in u]
-
-          for idx, blv in enumerate(blv_names):
-            stream_url = (
-                valid_m3u8[idx]
-                if idx < len(valid_m3u8)
-                else (valid_m3u8[0] if valid_m3u8 else match_url)
-            )
-
-            now_vn = datetime.now(TZ_VN)
-            extracted_channels.append({
-                'home_team': home_team,
-                'away_team': away_team,
-                'match_time': now_vn.strftime('%H:%M'),
-                'date': now_vn.strftime('%d/%m'),
-                'blv': blv,
-                'quality': 'FHD',
-                'stream_url': stream_url,
-                'logo': 'https://sutbongtve.cc/favicon.ico',
-            })
-
-          detail_page.close()
-        except Exception as e:
-          print(f'Lỗi quét trang chi tiết: {e}')
-
+  # Cào dữ liệu nhúng sẵn trên HTML nếu API direct bị chặn
+  if not matches:
+    try:
+      res = session.get('https://sutbongtve.cc/', timeout=12)
+      if res.status_code == 200:
+        html = res.text
+        # Tìm dữ liệu JSON state nhúng sẵn trong thẻ script
+        match_json = re.search(
+            r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.DOTALL
+        )
+        if match_json:
+          state_data = json.loads(match_json.group(1))
+          matches = (
+              state_data.get('matches')
+              or state_data.get('matchList')
+              or state_data.get('list')
+              or []
+          )
     except Exception as e:
-      print(f'Lỗi tổng quan: {e}')
-    finally:
-      browser.close()
+      print(f'Lỗi cào HTML: {e}')
 
-  return extracted_channels
+  return matches
 
 
-def generate_m3u(channels):
+def generate_m3u(matches_data):
   m3u_lines = ['#EXTM3U x-tvg-url=""']
 
-  if not channels:
-    print('Không có luồng phát nào được bóc tách.')
+  if not matches_data:
+    print('Không tìm thấy dữ liệu từ Sút Bóng TV.')
     return '\n'.join(m3u_lines)
 
-  print(f'Đang tạo danh sách M3U cho {len(channels)} luồng BLV...')
+  print(f'Đang tổng hợp dữ liệu {len(matches_data)} trận đấu...')
+  seen = set()
 
-  for ch in channels:
-    home = ch.get('home_team', 'Đội A')
-    away = ch.get('away_team', 'Đội B')
-    time_str = ch.get('match_time', '00:00')
-    date_str = ch.get('date', '20/10')
-    blv = ch.get('blv', 'Sút Bóng TV')
-    quality = ch.get('quality', 'FHD')
-    logo = ch.get('logo', '')
-    url = ch.get('stream_url', '')
+  for item in matches_data:
+    try:
+      home = (
+          item.get('home_name')
+          or item.get('home_team')
+          or item.get('home', {}).get('name')
+          or 'Đội A'
+      )
+      away = (
+          item.get('away_name')
+          or item.get('away_team')
+          or item.get('away', {}).get('name')
+          or 'Đội B'
+      )
 
-    # Định dạng hiển thị chuẩn theo yêu cầu:
-    # 09:00 20/10 ⚽ Escorpiones Belen vs Puntarenas FC (THOMAS) [FHD]
-    title_display = f'{time_str} {date_str} ⚽ {home} vs {away} ({blv}) [{quality}]'
+      if home == away or 'Đội' in home:
+        continue
 
-    m3u_lines.append(
-        f'#EXTINF:-1 tvg-logo="{logo}" group-title="Sút Bóng TV",{title_display}'
-    )
-    m3u_lines.append(url)
+      logo = (
+          item.get('home_logo')
+          or item.get('home', {}).get('logo')
+          or item.get('logo')
+          or ''
+      )
+      if logo and logo.startswith('/'):
+        logo = f'https://sutbongtve.cc{logo}'
+
+      match_time_raw = (
+          item.get('match_time')
+          or item.get('start_time')
+          or item.get('time_start')
+      )
+      time_str, date_str = parse_timestamp(match_time_raw)
+
+      sport_type = item.get('sport_type') or item.get('sport') or 'football'
+      sport_icon = get_sport_icon(sport_type)
+
+      # Bóc tách danh sách các luồng phát của từng BLV (THOMAS, BLV TAP, ZIDANE...)
+      links = (
+          item.get('links')
+          or item.get('play_urls')
+          or item.get('channels')
+          or []
+      )
+
+      if not links:
+        stream_url = (
+            item.get('stream_url')
+            or item.get('play_url')
+            or item.get('m3u8')
+            or item.get('url')
+            or 'https://sutbongtve.cc/'
+        )
+        blv = item.get('commentator') or item.get('blv') or 'Sút Bóng TV'
+        links = [{'url': stream_url, 'blv': blv, 'quality': 'FHD'}]
+
+      for idx, link in enumerate(links, 1):
+        if isinstance(link, dict):
+          s_url = (
+              link.get('url')
+              or link.get('play_url')
+              or link.get('m3u8')
+              or link.get('link')
+          )
+          blv_name = (
+              link.get('blv')
+              or link.get('commentator')
+              or link.get('name')
+              or item.get('commentator')
+              or f'BLV {idx}'
+          )
+          quality = link.get('quality') or 'FHD'
+        else:
+          s_url = str(link)
+          blv_name = item.get('commentator') or f'BLV {idx}'
+          quality = 'FHD'
+
+        if not s_url:
+          continue
+
+        # Đảm bảo không trùng lặp kênh
+        unique_key = f'{home}-{away}-{blv_name}'
+        if unique_key in seen:
+          continue
+        seen.add(unique_key)
+
+        # Định dạng chuẩn hiển thị theo hình mẫu yêu cầu:
+        # 09:00 20/10 ⚽ Escorpiones Belen vs Puntarenas FC (THOMAS) [FHD]
+        title_display = f'{time_str} {date_str} {sport_icon} {home} vs {away} ({blv_name}) [{quality}]'
+
+        m3u_lines.append(
+            f'#EXTINF:-1 tvg-logo="{logo}" group-title="Sút Bóng'
+            f' TV",{title_display}'
+        )
+        m3u_lines.append(s_url)
+
+    except Exception as e:
+      print(f'Lỗi xử lý kênh: {e}')
 
   return '\n'.join(m3u_lines)
 
 
 if __name__ == '__main__':
-  channels = fetch_matches_and_m3u8()
-  m3u_content = generate_m3u(channels)
+  data = fetch_data()
+  m3u_content = generate_m3u(data)
 
   with open('playlist.m3u', 'w', encoding='utf-8') as f:
     f.write(m3u_content)
 
-  print('Đã cập nhật file playlist.m3u chứa link video m3u8 trực tiếp!')
+  print('Đã cập nhật file playlist.m3u thành công!')
   
