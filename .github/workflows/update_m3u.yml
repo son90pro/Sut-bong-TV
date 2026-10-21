@@ -2,8 +2,8 @@ name: Auto Update Sutbong M3U
 
 on:
   schedule:
-    - cron: '0 * * * *' # Chạy mỗi giờ 1 lần
-  workflow_dispatch: # Cho phép chạy thủ công
+    - cron: '0 * * * *' # Chạy tự động mỗi giờ một lần
+  workflow_dispatch: # Cho phép anh bấm chạy thủ công trên GitHub bất cứ lúc nào
 
 jobs:
   update-playlist:
@@ -21,7 +21,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests
+        pip install -r requirements.txt
 
     - name: Run script to generate M3U
       run: python generate_m3u.py
